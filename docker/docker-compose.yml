@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:7.0
+    container_name: hmip-mongodb
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_DATABASE: hmip_db
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongodb/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - hmip-network
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: hmip-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - hmip-network
+
+  # Django Backend
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: hmip-backend
+    restart: always
+    environment:
+      - DEBUG=False
+      - SECRET_KEY=your-production-secret-key-change-this
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_DB_NAME=hmip_db
+      - MONGO_USER=admin
+      - MONGO_PASSWORD=admin123
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+      - redis
+    volumes:
+      - ../backend:/app
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    networks:
+      - hmip-network
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py collectstatic --noinput &&
+             daphne -b 0.0.0.0 -p 8000 hmip_backend.asgi:application"
+
+  # Celery Worker
+  celery-worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: hmip-celery-worker
+    restart: always
+    environment:
+      - DEBUG=False
+      - MONGO_HOST=mongodb
+      - REDIS_HOST=redis
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - mongodb
+      - redis
+      - backend
+    volumes:
+      - ../backend:/app
+    networks:
+      - hmip-network
+    command: celery -A hmip_backend worker --loglevel=info
+
+  # Celery Beat (Scheduler)
+  celery-beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: hmip-celery-beat
+    restart: always
+    environment:
+      - DEBUG=False
+      - MONGO_HOST=mongodb
+      - REDIS_HOST=redis
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - mongodb
+      - redis
+      - backend
+    volumes:
+      - ../backend:/app
+    networks:
+      - hmip-network
+    command: celery -A hmip_backend beat --loglevel=info
+
+  # React Frontend
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: hmip-frontend
+    restart: always
+    environment:
+      - REACT_APP_API_URL=http://backend:8000/api
+      - REACT_APP_WS_URL=ws://backend:8000/ws
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - hmip-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: hmip-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - static_volume:/static
+      - media_volume:/media
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - hmip-network
+
+volumes:
+  mongodb_data:
+  redis_data:
+  static_volume:
+  media_volume:
+
+networks:
+  hmip-network:
+    driver: bridge
